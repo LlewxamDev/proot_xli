@@ -54,6 +54,19 @@ o sistema vai pedir confirmação ao usuário antes de rodar — isso é esperad
 
 def _extract_json_objects(text: str) -> List[Dict[str, Any]]:
     """Extrai objetos JSON válidos mesmo quando há mais de um na resposta."""
+    text = text.strip()
+    fenced = re.match(r"^```(?:json)?\s*(.*?)\s*```$", text, re.IGNORECASE | re.DOTALL)
+    if fenced:
+        text = fenced.group(1).strip()
+    try:
+        value = json.loads(text)
+        if isinstance(value, dict) and "action" in value:
+            return [value]
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict) and "action" in item]
+    except json.JSONDecodeError:
+        pass
+
     decoder = json.JSONDecoder()
     objects: List[Dict[str, Any]] = []
     index = 0
@@ -81,11 +94,28 @@ def _extract_tool_calls(text: str) -> List[Dict[str, Any]]:
         re.IGNORECASE | re.DOTALL,
     )
     for block in pattern.findall(text):
-        name_match = re.match(r"([\w.-]+)", block.strip())
+        block = block.strip()
+        if block.startswith("{"):
+            try:
+                payload = json.loads(block)
+            except json.JSONDecodeError:
+                payload = None
+            if isinstance(payload, dict):
+                name = payload.get("name") or payload.get("action")
+                arguments = payload.get("arguments") or payload.get("parameters") or {}
+                if name:
+                    action = {"action": name}
+                    if isinstance(arguments, dict):
+                        action.update(arguments)
+                    actions.append(action)
+            continue
+
+        name_match = re.match(r"(?:name\s*[:=]\s*)?([\w.-]+)", block, re.IGNORECASE)
         if not name_match:
             continue
         action: Dict[str, Any] = {"action": name_match.group(1)}
-        for key, value in arg_pattern.findall(block[name_match.end():]):
+        remainder = block[name_match.end():]
+        for key, value in arg_pattern.findall(remainder):
             action[key.strip()] = value.strip()
         actions.append(action)
     return actions
@@ -268,6 +298,8 @@ class AgentEngine:
         invalid_responses = 0
 
         while True:
+            # Turnos com muitas ferramentas também precisam respeitar a janela de contexto.
+            self.history = await self.memory.trim_history(self.history, self._summarize_for_condensation)
             messages = [{"role": "system", "content": self.build_system_prompt()}] + self.history
 
             try:
@@ -307,19 +339,19 @@ class AgentEngine:
                     continue
 
                 if kind == "run_bash_command":
-                    command = str(action.get("command", "")).strip()
-                    if not command:
-                        result_text = "Erro: comando vazio."
-                        self.history.append({"role": "user", "content": f"[resultado do comando]\n{result_text}"})
-                        await emit({"type": "tool_result", "output": result_text})
-                        continue
-
                     tool_steps += 1
                     if tool_steps > MAX_TOOL_STEPS:
                         message = f"Interrompi por segurança após {MAX_TOOL_STEPS} passos de ferramenta."
                         self.history.append({"role": "user", "content": f"[sistema] {message}"})
                         await emit({"type": "final", "text": message})
                         return
+
+                    command = str(action.get("command", "")).strip()
+                    if not command:
+                        result_text = "Erro: comando vazio."
+                        self.history.append({"role": "user", "content": f"[resultado do comando]\n{result_text}"})
+                        await emit({"type": "tool_result", "output": result_text})
+                        continue
 
                     if is_dangerous(command):
                         approved = await confirm(command)
