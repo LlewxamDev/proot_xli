@@ -18,7 +18,7 @@ from openai import AsyncOpenAI
 
 from config import (
     OPENROUTER_BASE_URL, OPENROUTER_MODELS_URL, OPENROUTER_SITE_URL, OPENROUTER_APP_NAME,
-    DEFAULT_FALLBACK_MODELS, MAX_CONSECUTIVE_TOOL_CALLS,
+    DEFAULT_FALLBACK_MODELS, MAX_TOOL_STEPS,
 )
 from executor import BashExecutor, is_dangerous
 from memory_manager import MemoryManager
@@ -41,8 +41,8 @@ em um dos formatos abaixo:
 {{"action": "final_answer", "text": "<sua resposta em markdown>"}}
 
 Regras importantes:
-- Nunca execute mais de {max_tools} comandos seguidos sem dar um "final_answer" relatando o que \
-já descobriu.
+- Continue executando os comandos necessários e só finalize quando tiver uma conclusão. Há um limite \
+de segurança de {max_tools} passos de ferramenta por turno para impedir loops infinitos.
 - Prefira poucos comandos objetivos a varreduras longas e desnecessárias.
 - Se o comando for potencialmente destrutivo (rm -rf, dd, chmod -R 777, apt remove, mkfs etc.), \
 o sistema vai pedir confirmação ao usuário antes de rodar — isso é esperado, não é um erro seu.
@@ -52,23 +52,49 @@ o sistema vai pedir confirmação ao usuário antes de rodar — isso é esperad
 """
 
 
-def _extract_json(text: str) -> Optional[Dict[str, Any]]:
-    """Parser tolerante: remove blocos ```json``` se existirem e extrai o primeiro {...} válido."""
-    text = text.strip()
-    fenced = re.match(r"^```(?:json)?\s*(.*?)\s*```$", text, re.DOTALL)
-    if fenced:
-        text = fenced.group(1).strip()
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if match:
+def _extract_json_objects(text: str) -> List[Dict[str, Any]]:
+    """Extrai objetos JSON válidos mesmo quando há mais de um na resposta."""
+    decoder = json.JSONDecoder()
+    objects: List[Dict[str, Any]] = []
+    index = 0
+    while index < len(text):
+        start = text.find("{", index)
+        if start < 0:
+            break
         try:
-            return json.loads(match.group(0))
-        except Exception:
-            return None
-    return None
+            value, end = decoder.raw_decode(text[start:])
+        except json.JSONDecodeError:
+            index = start + 1
+            continue
+        if isinstance(value, dict) and "action" in value:
+            objects.append(value)
+        index = start + end
+    return objects
+
+
+def _extract_tool_calls(text: str) -> List[Dict[str, Any]]:
+    """Converte o formato XML de tool calling de alguns modelos em ações internas."""
+    actions: List[Dict[str, Any]] = []
+    pattern = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.IGNORECASE | re.DOTALL)
+    arg_pattern = re.compile(
+        r"<arg_key>\s*(.*?)\s*</arg_key>\s*<arg_value>\s*(.*?)\s*</arg_value>",
+        re.IGNORECASE | re.DOTALL,
+    )
+    for block in pattern.findall(text):
+        name_match = re.match(r"([\w.-]+)", block.strip())
+        if not name_match:
+            continue
+        action: Dict[str, Any] = {"action": name_match.group(1)}
+        for key, value in arg_pattern.findall(block[name_match.end():]):
+            action[key.strip()] = value.strip()
+        actions.append(action)
+    return actions
+
+
+def _extract_actions(text: str) -> List[Dict[str, Any]]:
+    """Aceita JSON, vários objetos JSON e <tool_call> sem expor o protocolo ao usuário."""
+    actions = _extract_json_objects(text.strip())
+    return actions or _extract_tool_calls(text)
 
 
 def fetch_and_rank_free_models() -> List[str]:
@@ -217,7 +243,7 @@ class AgentEngine:
 
     def build_system_prompt(self) -> str:
         return SYSTEM_PROMPT_TEMPLATE.format(
-            max_tools=MAX_CONSECUTIVE_TOOL_CALLS,
+            max_tools=MAX_TOOL_STEPS,
             persistent_memory=self.memory.persistent_context_block(),
         )
 
@@ -238,7 +264,8 @@ class AgentEngine:
         self.history.append({"role": "user", "content": user_text})
         self.history = await self.memory.trim_history(self.history, self._summarize_for_condensation)
 
-        consecutive_tools = 0
+        tool_steps = 0
+        invalid_responses = 0
 
         while True:
             messages = [{"role": "system", "content": self.build_system_prompt()}] + self.history
@@ -249,58 +276,66 @@ class AgentEngine:
                 await emit({"type": "error", "text": f"Erro de API: {e}"})
                 return
 
-            action = _extract_json(raw)
-            if not action or "action" not in action:
-                # Modelo não obedeceu ao protocolo — trata a resposta como texto final mesmo assim.
-                self.history.append({"role": "assistant", "content": raw})
-                await emit({"type": "final", "text": raw})
-                return
-
-            kind = action.get("action")
-
-            if kind == "final_answer":
-                self.history.append({"role": "assistant", "content": raw})
-                await emit({"type": "final", "text": action.get("text", "")})
-                return
-
-            if kind == "save_memory":
-                fact = action.get("fact", "")
-                self.memory.add_fact(fact)
-                self.history.append({"role": "assistant", "content": raw})
-                self.history.append({"role": "user", "content": f"[sistema] Fato salvo na memória: {fact}"})
-                await emit({"type": "status", "text": f"Memória atualizada: {fact}"})
+            actions = _extract_actions(raw)
+            if not actions:
+                # Não contamina o histórico nem mostra XML/JSON interno ao usuário.
+                invalid_responses += 1
+                if invalid_responses >= 2:
+                    await emit({"type": "error", "text": "O modelo não retornou uma ação válida após duas tentativas."})
+                    return
+                self.history.append({"role": "user", "content": "[sistema] Resposta inválida. Retorne somente uma ação JSON válida ou blocos <tool_call> válidos."})
+                await emit({"type": "status", "text": "Resposta fora do protocolo; solicitando correção ao modelo."})
                 continue
 
-            if kind == "run_bash_command":
-                command = action.get("command", "")
-                consecutive_tools += 1
-                self.history.append({"role": "assistant", "content": raw})
+            invalid_responses = 0
+            # Registra apenas a forma normalizada, nunca o XML bruto do modelo.
+            self.history.append({"role": "assistant", "content": json.dumps(actions, ensure_ascii=False)})
 
-                if consecutive_tools > MAX_CONSECUTIVE_TOOL_CALLS:
-                    warn = (f"[sistema] Limite de {MAX_CONSECUTIVE_TOOL_CALLS} comandos seguidos atingido. "
-                            "Responda agora com final_answer resumindo o que já foi descoberto.")
-                    self.history.append({"role": "user", "content": warn})
-                    await emit({"type": "status", "text": "Trava de segurança: exigindo relatório em texto."})
-                    consecutive_tools = 0
+            for action in actions:
+                kind = action.get("action")
+
+                if kind == "final_answer":
+                    await emit({"type": "final", "text": action.get("text", "")})
+                    return
+
+                if kind == "save_memory":
+                    fact = str(action.get("fact", "")).strip()
+                    if fact:
+                        self.memory.add_fact(fact)
+                        self.history.append({"role": "user", "content": f"[sistema] Fato salvo na memória: {fact}"})
+                        await emit({"type": "status", "text": f"Memória atualizada: {fact}"})
                     continue
 
-                if is_dangerous(command):
-                    approved = await confirm(command)
-                    if not approved:
-                        result_text = "Usuário NÃO autorizou este comando. Ação cancelada."
+                if kind == "run_bash_command":
+                    command = str(action.get("command", "")).strip()
+                    if not command:
+                        result_text = "Erro: comando vazio."
                         self.history.append({"role": "user", "content": f"[resultado do comando]\n{result_text}"})
                         await emit({"type": "tool_result", "output": result_text})
                         continue
 
-                await emit({"type": "tool_call", "command": command})
-                result = await self.executor.run(command)
-                output = result.output
+                    tool_steps += 1
+                    if tool_steps > MAX_TOOL_STEPS:
+                        message = f"Interrompi por segurança após {MAX_TOOL_STEPS} passos de ferramenta."
+                        self.history.append({"role": "user", "content": f"[sistema] {message}"})
+                        await emit({"type": "final", "text": message})
+                        return
 
-                self.history.append({"role": "user", "content": f"[resultado do comando]\n{output}"})
-                await emit({"type": "tool_result", "output": output})
-                continue
+                    if is_dangerous(command):
+                        approved = await confirm(command)
+                        if not approved:
+                            result_text = "Usuário NÃO autorizou este comando. Ação cancelada."
+                            self.history.append({"role": "user", "content": f"[resultado do comando]\n{result_text}"})
+                            await emit({"type": "tool_result", "output": result_text})
+                            continue
 
-            # Ação desconhecida — encerra o turno com aviso em vez de travar o loop.
-            self.history.append({"role": "assistant", "content": raw})
-            await emit({"type": "error", "text": f"Ação desconhecida retornada pelo modelo: {kind}"})
-            return
+                    await emit({"type": "tool_call", "command": command})
+                    result = await self.executor.run(command)
+                    output = result.output
+                    self.history.append({"role": "user", "content": f"[resultado do comando]\n{output}"})
+                    await emit({"type": "tool_result", "output": output})
+                    continue
+
+                # Ação desconhecida: pede correção ao modelo sem vazar o protocolo para a UI.
+                self.history.append({"role": "user", "content": f"[sistema] Ação desconhecida: {kind}. Use run_bash_command, save_memory ou final_answer."})
+                await emit({"type": "status", "text": f"Ação desconhecida ({kind}); solicitando correção ao modelo."})

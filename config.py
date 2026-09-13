@@ -30,7 +30,7 @@ CONDENSE_CHUNK = 10               # quantas mensagens antigas condensar de uma v
 MAX_BASH_OUTPUT_CHARS = 1500      # truncamento de stdout/stderr de comandos
 
 # --- Segurança / Loop Guardrail (Pilar 4) ---
-MAX_CONSECUTIVE_TOOL_CALLS = 3    # comandos bash seguidos antes de exigir relatório em texto
+MAX_TOOL_STEPS = 30               # limite total por turno, contra loops infinitos
 BASH_TIMEOUT_SECONDS = 60
 
 # Padrões de comando considerados perigosos — exigem confirmação explícita do usuário
